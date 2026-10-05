@@ -23,6 +23,8 @@ import com.jarves.mh.model.ChatAttachment
 import com.jarves.mh.model.DevStack
 import com.jarves.mh.model.Project
 import com.jarves.mh.model.ProjectKind
+import com.jarves.mh.model.ProjectType
+import com.jarves.mh.model.AndroidTemplate
 import com.jarves.mh.model.ProjectChat
 import com.jarves.mh.model.ProviderKind
 import com.jarves.mh.model.ProviderProfile
@@ -54,6 +56,16 @@ import com.jarves.mh.runtime.RuntimeSetupStatus
 import com.jarves.mh.runtime.readTailText
 import com.jarves.mh.runtime.supportsArm64Runtime
 import com.jarves.mh.runtime.AndroidAppInstaller
+import com.jarves.mh.runtime.AndroidBuildPhase
+import com.jarves.mh.runtime.AndroidBuildRecord
+import com.jarves.mh.runtime.AndroidProjectTemplateGenerator
+import com.jarves.mh.runtime.RuntimeExecutionService
+import com.jarves.mh.runtime.RuntimeTaskController
+import com.jarves.mh.runtime.androidGradleCommand
+import com.jarves.mh.runtime.diagnoseAndroidBuildFailure
+import com.jarves.mh.runtime.findAndroidProjectRoot
+import com.jarves.mh.runtime.findDebugApk
+import com.jarves.mh.runtime.findReusableDebugApk
 import com.jarves.mh.update.AppUpdateInfo
 import com.jarves.mh.update.AppUpdater
 import java.io.File
@@ -123,6 +135,13 @@ private data class RuntimeRetryRequest(
     val prompt: String,
     val history: List<ChatMessage>,
     val provider: ProviderProfile,
+)
+
+data class QueuedFollowUp(
+    val id: String = UUID.randomUUID().toString(),
+    val projectId: String,
+    val prompt: String,
+    val attachments: List<ChatAttachment>,
 )
 
 private data class TranscriptWrite(
@@ -198,6 +217,7 @@ data class AppUiState(
     val previewReady: Boolean = false,
     val previewUrl: String? = null,
     val isRunning: Boolean = false,
+    val queuedFollowUps: List<QueuedFollowUp> = emptyList(),
     val activeSessionId: String? = null,
     val toastMessage: String? = null,
     val projectTerminalLines: List<TerminalOutputLine> = emptyList(),
@@ -240,6 +260,12 @@ data class AppUiState(
     val antigravityModelsLoading: Boolean = false,
     val androidBuildRunning: Boolean = false,
     val androidBuildMessage: String? = null,
+    val androidBuildPhase: AndroidBuildPhase = AndroidBuildPhase.IDLE,
+    val androidBuildLog: String = "",
+    val androidBuildStartedAtMillis: Long? = null,
+    val androidBuildFinishedAtMillis: Long? = null,
+    val androidBuildApkPath: String? = null,
+    val androidBuildApkSizeBytes: Long? = null,
     val appUpdate: AppUpdateInfo? = null,
     val appUpdateStatus: AppUpdateStatus? = null,
     val appUpdateDownloadedBytes: Long = 0L,
@@ -275,11 +301,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile private var terminalProcess: Process? = null
     @Volatile private var projectTerminalProjectId: String? = null
     @Volatile private var projectTerminalStopRequested: Boolean = false
+    @Volatile private var androidBuildProcess: Process? = null
+    @Volatile private var androidBuildStopRequested: Boolean = false
     @Volatile private var setupCompletionHandled: Boolean = false
     @Volatile private var githubAuthProcess: Process? = null
     private var githubAuthJob: kotlinx.coroutines.Job? = null
     @Volatile private var lastOpenedAntigravityAuthUrl: String? = null
     private var activeRuntimeRequest: RuntimeRetryRequest? = null
+    private val pendingFollowUps = java.util.ArrayDeque<QueuedFollowUp>()
+    @Volatile private var steeringToFollowUp: Boolean = false
     private val failedApiKeyIds = mutableSetOf<String>()
     private val transcriptWrites = Channel<TranscriptWrite>(Channel.UNLIMITED)
     private val initialAgentKind = AgentKind.fromStored(preferences.agentKind)
@@ -516,7 +546,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun requestProjectTerminalCommand(command: String) {
         val normalized = command.trim()
-        if (normalized.isBlank() || _state.value.projectTerminalRunning || projectTerminalProcess?.isAlive == true) return
+        if (normalized.isBlank() || _state.value.projectTerminalRunning || _state.value.androidBuildRunning || projectTerminalProcess?.isAlive == true) return
         if (requiresAndroidToolchain(normalized) && !installer.isStackInstalled(DevStack.ANDROID)) {
             _state.update {
                 it.copy(toastMessage = "Android build tools are not installed. Add Android in Settings → Development stacks.")
@@ -532,7 +562,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun prepareProjectTerminalCommand(command: String) {
         val project = _state.value.activeProject ?: return
-        if (command.isBlank() || _state.value.projectTerminalRunning) return
+        if (command.isBlank() || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         _state.update {
             it.copy(
                 projectTerminalCwd = projectGuestRoot(project),
@@ -547,7 +577,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun openProjectTerminal() {
         val project = _state.value.activeProject ?: return
-        if (_state.value.projectTerminalRunning) return
+        if (_state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         _state.update { it.copy(projectTerminalCwd = projectGuestRoot(project)) }
     }
 
@@ -563,7 +593,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun runProjectTerminalCommand(command: String) {
         val project = _state.value.activeProject ?: return
-        if (_state.value.projectTerminalRunning) return
+        if (_state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         val startingCwd = _state.value.projectTerminalCwd
         val existingLines = _state.value.projectTerminalLines
         projectTerminalStopRequested = false
@@ -850,6 +880,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun buildAndRunAndroidApp() {
+        if (openReusableAndroidBuild()) return
+        startAndroidGradleTask("assembleDebug", installAfterBuild = true)
+    }
+
+    private fun openReusableAndroidBuild(): Boolean {
+        val current = _state.value
+        val project = current.activeProject ?: return false
+        if (current.isRunning || current.projectTerminalRunning || current.androidBuildRunning) return false
+        val workspace = findAndroidProjectRoot(projectWorkspaceRoot(project)) ?: return false
+        val apk = findReusableDebugApk(workspace) ?: return false
+        val opened = AndroidAppInstaller.openIfAlreadyInstalled(getApplication(), apk)
+        if (!opened) AndroidAppInstaller.install(getApplication(), apk)
+        val now = System.currentTimeMillis()
+        val message = if (opened) {
+            "No changes — opened the installed app"
+        } else {
+            "No changes — using the existing APK"
+        }
+        _state.update {
+            it.copy(
+                androidBuildRunning = false,
+                androidBuildPhase = AndroidBuildPhase.SUCCEEDED,
+                androidBuildMessage = message,
+                androidBuildLog = "Gradle skipped: project files have not changed since the last successful build.\n",
+                androidBuildStartedAtMillis = now,
+                androidBuildFinishedAtMillis = now,
+                androidBuildApkPath = apk.absolutePath,
+                androidBuildApkSizeBytes = apk.length(),
+                toastMessage = message,
+            )
+        }
+        saveAndroidBuildRecord(project.id)
+        return true
+    }
+
+    fun cleanAndroidProject() {
+        startAndroidGradleTask("clean", installAfterBuild = false)
+    }
+
+    fun cancelAndroidBuild() {
+        if (!_state.value.androidBuildRunning) return
+        androidBuildStopRequested = true
+        _state.update {
+            it.copy(androidBuildPhase = AndroidBuildPhase.CANCELLING, androidBuildMessage = "Stopping Gradle safely…")
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            androidBuildProcess?.destroy()
+            delay(500)
+            if (androidBuildProcess?.isAlive == true) androidBuildProcess?.destroyForcibly()
+        }
+    }
+
+    private fun startAndroidGradleTask(task: String, installAfterBuild: Boolean) {
         val project = _state.value.activeProject ?: return
         if (_state.value.androidBuildRunning) return
         if (!installer.isStackInstalled(DevStack.ANDROID)) {
@@ -866,66 +949,202 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(toastMessage = "Wait for the project terminal command to finish before building.") }
             return
         }
-        _state.update { it.copy(androidBuildRunning = true, androidBuildMessage = "Building debug APK…", toastMessage = null) }
+        val startedAt = System.currentTimeMillis()
+        androidBuildStopRequested = false
+        _state.update {
+            it.copy(
+                androidBuildRunning = true,
+                androidBuildPhase = AndroidBuildPhase.PREPARING,
+                androidBuildMessage = if (task == "clean") "Preparing clean…" else "Preparing Android build…",
+                androidBuildLog = "",
+                androidBuildStartedAtMillis = startedAt,
+                androidBuildFinishedAtMillis = null,
+                androidBuildApkPath = null,
+                androidBuildApkSizeBytes = null,
+                toastMessage = null,
+            )
+        }
+        saveAndroidBuildRecord(project.id)
+        startAndroidBuildForegroundService(project, task)
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val installed = installer.installedRuntime()
-                val workspace = findAndroidGradleProjectRoot(projectWorkspaceRoot(project))
+                val workspace = findAndroidProjectRoot(projectWorkspaceRoot(project))
                     ?: error("No Android Gradle project found yet. Ask Claude to create it, then wait for the task to finish.")
+                val command = androidGradleCommand(workspace, task)
+                _state.update {
+                    it.copy(
+                        androidBuildPhase = AndroidBuildPhase.BUILDING,
+                        androidBuildMessage = if (task == "clean") "Cleaning project…" else "Running assembleDebug…",
+                        androidBuildLog = "$ $command\n",
+                    )
+                }
                 val process = installer.process(
                     installed.proot, installed.rootfs, workspace, emptyMap(),
-                    listOf(
-                        "/usr/bin/bash", "-lc",
-                        "gradle --init-script /root/.gradle/init.d/pocketdev-android.gradle " +
-                            "-Pandroid.aapt2FromMavenOverride=/root/android-sdk/build-tools/35.0.0/aapt2 " +
-                            "--no-daemon assembleDebug --console=plain",
-                    ),
+                    listOf("/usr/bin/bash", "-lc", command),
                     projectGuestRoot(project),
                 )
-                val exitCode = process.waitFor()
-                val buildOutput = (process as? NativeSpawnProcess)?.outputFile?.readTailText(MAX_PROCESS_OUTPUT_BYTES).orEmpty()
-                check(exitCode == 0) {
-                    buildOutput.trim().takeLast(2_000).ifBlank { "Gradle build failed (exit code $exitCode)" }
+                androidBuildProcess = process
+                RuntimeTaskController.stopAction = ::cancelAndroidBuild
+                val native = process as? NativeSpawnProcess ?: error("Unsupported Android build process")
+                var offset = 0L
+                while (process.isAlive || native.outputFile.length() > offset) {
+                    val available = native.outputFile.length() - offset
+                    if (available <= 0L) {
+                        Thread.sleep(75)
+                        continue
+                    }
+                    val bytes = ByteArray(minOf(available, 16L * 1024).toInt())
+                    val count = RandomAccessFile(native.outputFile, "r").use { file ->
+                        file.seek(offset)
+                        file.read(bytes)
+                    }
+                    if (count > 0) {
+                        offset += count
+                        val chunk = sanitizeTerminalOutput(bytes.decodeToString(0, count))
+                        _state.update { current ->
+                            current.copy(androidBuildLog = (current.androidBuildLog + chunk).takeLast(MAX_ANDROID_BUILD_LOG))
+                        }
+                    }
                 }
-                val apk = workspace.walkTopDown()
-                    .filter { it.isFile && it.extension.equals("apk", ignoreCase = true) && it.path.contains("/outputs/apk/debug/") }
-                    .maxByOrNull(File::lastModified)
+                val exitCode = process.waitFor()
+                val buildOutput = sanitizeTerminalOutput(native.outputFile.readTailText(MAX_PROCESS_OUTPUT_BYTES))
+                if (androidBuildStopRequested) throw java.util.concurrent.CancellationException("Build cancelled")
+                check(exitCode == 0) {
+                    diagnoseAndroidBuildFailure(buildOutput, exitCode)
+                }
+                if (!installAfterBuild) null else findDebugApk(workspace)
                     ?: error("Gradle finished but no debug APK was found")
-                AndroidAppInstaller.install(getApplication(), apk)
-            }.onSuccess {
+            }.onSuccess { apk ->
+                apk?.let { AndroidAppInstaller.install(getApplication(), it) }
+                val message = if (apk == null) "Project cleaned successfully" else "APK ready — complete Android's install prompt"
                 withContext(Dispatchers.Main) {
                     _state.update {
                         it.copy(
                             androidBuildRunning = false,
-                            androidBuildMessage = "APK sent to Android installer",
-                            toastMessage = "APK built. Complete Android's install prompt.",
+                            androidBuildPhase = AndroidBuildPhase.SUCCEEDED,
+                            androidBuildMessage = message,
+                            androidBuildFinishedAtMillis = System.currentTimeMillis(),
+                            androidBuildApkPath = apk?.absolutePath,
+                            androidBuildApkSizeBytes = apk?.length(),
+                            toastMessage = message,
                         )
                     }
+                    saveAndroidBuildRecord(project.id)
                 }
+                finishAndroidBuildForegroundService(project, message, failed = false)
             }.onFailure { error ->
+                val cancelled = error is java.util.concurrent.CancellationException || androidBuildStopRequested
+                val message = if (cancelled) "Android build cancelled" else error.message ?: "Could not build APK"
                 withContext(Dispatchers.Main) {
-                    _state.update { it.copy(androidBuildRunning = false, androidBuildMessage = null, toastMessage = error.message ?: "Could not build APK") }
+                    _state.update {
+                        it.copy(
+                            androidBuildRunning = false,
+                            androidBuildPhase = if (cancelled) AndroidBuildPhase.CANCELLED else AndroidBuildPhase.FAILED,
+                            androidBuildMessage = message,
+                            androidBuildFinishedAtMillis = System.currentTimeMillis(),
+                            toastMessage = message,
+                        )
+                    }
+                    saveAndroidBuildRecord(project.id)
+                }
+                finishAndroidBuildForegroundService(project, message, failed = !cancelled, cancelled = cancelled)
+            }.also {
+                androidBuildProcess = null
+                androidBuildStopRequested = false
+                RuntimeTaskController.stopAction = null
+                steeringToFollowUp = false
+                if (pendingFollowUps.isNotEmpty()) {
+                    viewModelScope.launch {
+                        delay(150)
+                        if (!_state.value.isRunning && !_state.value.androidBuildRunning && !_state.value.projectTerminalRunning) {
+                            startNextFollowUp()
+                        }
+                    }
                 }
             }
         }
     }
 
-    private fun findAndroidGradleProjectRoot(workspace: File): File? {
-        val settingsNames = setOf("settings.gradle", "settings.gradle.kts", "settings.gradle.dcl")
-        return workspace.walkTopDown()
-            .maxDepth(4)
-            .filter { it.isFile && it.name in settingsNames }
-            .mapNotNull(File::getParentFile)
-            .sortedBy { it.absolutePath.length }
-            .firstOrNull { root ->
-                root.walkTopDown()
-                    .maxDepth(4)
-                    .any { it.isFile && it.invariantSeparatorsPath.endsWith("src/main/AndroidManifest.xml") }
-            }
-    }
-
     private fun requiresAndroidToolchain(command: String): Boolean =
         Regex("(?m)(^|[;&|]\\s*)(?:\\./)?gradle(?:w)?(?:\\s|$)", RegexOption.IGNORE_CASE).containsMatchIn(command)
+
+    private fun startAndroidBuildForegroundService(project: Project, task: String) {
+        ContextCompat.startForegroundService(
+            getApplication(),
+            Intent(getApplication(), RuntimeExecutionService::class.java)
+                .setAction(RuntimeExecutionService.ACTION_START)
+                .putExtra(RuntimeExecutionService.EXTRA_PROJECT_NAME, project.name)
+                .putExtra(RuntimeExecutionService.EXTRA_TITLE, if (task == "clean") "Cleaning Android project" else "Building Android app")
+                .putExtra(RuntimeExecutionService.EXTRA_DETAIL, if (task == "clean") "Running Gradle clean" else "Running Gradle assembleDebug")
+                .putExtra(RuntimeExecutionService.EXTRA_CAN_STOP, true),
+        )
+    }
+
+    private fun finishAndroidBuildForegroundService(
+        project: Project,
+        detail: String,
+        failed: Boolean,
+        cancelled: Boolean = false,
+    ) {
+        runCatching {
+            getApplication<Application>().startService(
+                Intent(getApplication(), RuntimeExecutionService::class.java)
+                    .setAction(
+                        when {
+                            cancelled -> RuntimeExecutionService.ACTION_CANCELLED
+                            failed -> RuntimeExecutionService.ACTION_FAILED
+                            else -> RuntimeExecutionService.ACTION_COMPLETE
+                        },
+                    )
+                    .putExtra(RuntimeExecutionService.EXTRA_PROJECT_NAME, project.name)
+                    .putExtra(RuntimeExecutionService.EXTRA_DETAIL, detail),
+            )
+        }
+    }
+
+    private fun androidBuildRecordFile(projectId: String): File =
+        File(getApplication<Application>().filesDir, "android-builds/$projectId.json")
+
+    private fun saveAndroidBuildRecord(projectId: String) {
+        val state = _state.value
+        runCatching {
+            androidBuildRecordFile(projectId).apply {
+                parentFile?.mkdirs()
+                writeText(
+                    JSONObject()
+                        .put("phase", state.androidBuildPhase.name)
+                        .put("message", state.androidBuildMessage)
+                        .put("log", state.androidBuildLog.takeLast(MAX_ANDROID_BUILD_LOG))
+                        .put("startedAtMillis", state.androidBuildStartedAtMillis)
+                        .put("finishedAtMillis", state.androidBuildFinishedAtMillis)
+                        .put("apkPath", state.androidBuildApkPath)
+                        .put("apkSizeBytes", state.androidBuildApkSizeBytes)
+                        .toString(),
+                )
+            }
+        }
+    }
+
+    private fun loadAndroidBuildRecord(projectId: String): AndroidBuildRecord {
+        val file = androidBuildRecordFile(projectId)
+        if (!file.isFile) return AndroidBuildRecord()
+        return runCatching {
+            val json = JSONObject(file.readText())
+            val phase = runCatching { AndroidBuildPhase.valueOf(json.optString("phase")) }
+                .getOrDefault(AndroidBuildPhase.IDLE)
+                .let { if (it in setOf(AndroidBuildPhase.PREPARING, AndroidBuildPhase.BUILDING, AndroidBuildPhase.CANCELLING)) AndroidBuildPhase.CANCELLED else it }
+            AndroidBuildRecord(
+                phase = phase,
+                message = if (phase == AndroidBuildPhase.CANCELLED) "Previous Android build was interrupted" else json.optString("message").takeIf(String::isNotBlank),
+                log = json.optString("log"),
+                startedAtMillis = json.optLong("startedAtMillis").takeIf { it > 0L },
+                finishedAtMillis = json.optLong("finishedAtMillis").takeIf { it > 0L },
+                apkPath = json.optString("apkPath").takeIf { it.isNotBlank() && File(it).isFile },
+                apkSizeBytes = json.optLong("apkSizeBytes").takeIf { it > 0L },
+            )
+        }.getOrDefault(AndroidBuildRecord())
+    }
 
 
     fun toggleTheme() {
@@ -1857,7 +2076,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        if (current.isRunning || current.projectTerminalRunning) {
+        if (current.isRunning || current.projectTerminalRunning || current.androidBuildRunning) {
             val chats = preferences.loadProjectChats(project.id).ifEmpty {
                 listOf(ProjectChat(title = "Main chat"))
             }
@@ -1881,6 +2100,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val activeChat = chats.first()
         val saved = preferences.loadMessages(project.id, activeChat.id)
         val msgs = saved.ifEmpty { listOf(ChatMessage(fromUser = false, text = "Hi! Tell me what you want to build or change.")) }
+        val androidBuild = loadAndroidBuildRecord(project.id)
         _state.update {
             it.copy(
                 activeProject = project,
@@ -1911,6 +2131,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 previewReady = false,
                 previewUrl = null,
                 pendingAttachments = emptyList(),
+                androidBuildRunning = false,
+                androidBuildPhase = androidBuild.phase,
+                androidBuildMessage = androidBuild.message,
+                androidBuildLog = androidBuild.log,
+                androidBuildStartedAtMillis = androidBuild.startedAtMillis,
+                androidBuildFinishedAtMillis = androidBuild.finishedAtMillis,
+                androidBuildApkPath = androidBuild.apkPath,
+                androidBuildApkSizeBytes = androidBuild.apkSizeBytes,
             )
         }
         refreshProjectFiles()
@@ -1923,14 +2151,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun closeProject() {
         val active = _state.value.activeProject
         persistMessages()
-        if (_state.value.isRunning || _state.value.projectTerminalRunning) {
+        if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) {
             _state.update {
                 it.copy(
                     workspaceVisible = false,
-                    toastMessage = if (it.isRunning) {
-                        "Task continues in the background"
-                    } else {
-                        "Terminal command continues in the background"
+                    toastMessage = when {
+                        it.isRunning -> "Task continues in the background"
+                        it.androidBuildRunning -> "Android build continues in the background"
+                        else -> "Terminal command continues in the background"
                     },
                 )
             }
@@ -2010,7 +2238,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun activateReadOnlyProject() {
-        if (_state.value.isRunning || _state.value.projectTerminalRunning) return
+        if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         val project = _state.value.readOnlyProject ?: return
         closeReadOnlyProject()
         openProject(project)
@@ -2020,7 +2248,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createProject(name: String) {
         if (name.isBlank()) return
-        if (_state.value.isRunning || _state.value.projectTerminalRunning) {
+        if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) {
             _state.update { it.copy(toastMessage = "Stop the background task before creating another project") }
             return
         }
@@ -2071,8 +2299,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshProjectFiles()
     }
 
+    fun createAndroidProject(name: String, template: AndroidTemplate) {
+        if (name.isBlank()) return
+        if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) {
+            _state.update { it.copy(toastMessage = "Stop the active task before creating another project") }
+            return
+        }
+        val cleanName = name.replace(Regex("\\s+"), " ").trim().take(60)
+        val baseSlug = projectSlug(cleanName)
+        val usedSlugs = _state.value.projects.mapTo(mutableSetOf()) { it.slug }
+        val slug = generateSequence(1) { it + 1 }
+            .map { number -> if (number == 1) baseSlug else "$baseSlug-$number" }
+            .first { it !in usedSlugs }
+        val project = Project(
+            name = cleanName,
+            description = if (template == AndroidTemplate.COMPOSE) "Android · Jetpack Compose" else "Android · Kotlin + XML",
+            language = "Kotlin",
+            slug = slug,
+            type = ProjectType.ANDROID,
+            androidTemplate = template,
+        )
+        val workspace = File(getApplication<Application>().filesDir, "workspaces/${project.id}")
+        runCatching { AndroidProjectTemplateGenerator.generate(workspace, cleanName, template) }
+            .onFailure { error ->
+                _state.update { it.copy(toastMessage = error.message ?: "Could not create Android project") }
+                return
+            }
+        val firstChat = ProjectChat(title = "New chat")
+        preferences.saveProjectChats(project.id, listOf(firstChat))
+        _state.update { it.copy(projects = listOf(project) + it.projects) }
+        preferences.saveProjects(_state.value.projects)
+        openProject(project)
+        if (!installer.isStackInstalled(DevStack.ANDROID)) {
+            _state.update { it.copy(toastMessage = "Android project created. Install Android tools from Settings before building.") }
+        }
+    }
+
     fun createQuickProject() {
-        if (_state.value.isRunning || _state.value.projectTerminalRunning) {
+        if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) {
             _state.update { it.copy(toastMessage = "Stop the background task before creating another project") }
             return
         }
@@ -2093,7 +2357,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun importZipProject(uri: Uri) {
-        if (_state.value.projectImporting || _state.value.isRunning || _state.value.projectTerminalRunning) return
+        if (_state.value.projectImporting || _state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         _state.update { it.copy(projectImporting = true, projectImportMessage = "Reading project archive…") }
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { extractImportedProject(uri) } }
@@ -2256,7 +2520,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun cloneGitRepository(url: String, repositoryName: String?, branch: String?, useGitHubCli: Boolean) {
-        if (_state.value.gitCloneRunning || _state.value.projectImporting || _state.value.isRunning || _state.value.projectTerminalRunning) return
+        if (_state.value.gitCloneRunning || _state.value.projectImporting || _state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         val normalized = runCatching { validateGitUrl(url) }.getOrElse { error ->
             _state.update { it.copy(toastMessage = error.message ?: "Enter a valid public HTTPS Git URL") }
             return
@@ -2653,13 +2917,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteProject(projectId: String) {
         val project = _state.value.projects.firstOrNull { it.id == projectId } ?: return
-        if (_state.value.activeProject?.id == projectId || _state.value.isRunning || _state.value.projectTerminalRunning) return
+        if (_state.value.activeProject?.id == projectId || _state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         _state.update { current -> current.copy(projects = current.projects.filterNot { it.id == projectId }) }
         preferences.saveProjects(_state.value.projects)
         viewModelScope.launch(Dispatchers.IO) {
             val filesDir = getApplication<Application>().filesDir
             File(filesDir, "workspaces/${project.id}").deleteRecursively()
             terminalHistoryFile(project.id).delete()
+            androidBuildRecordFile(project.id).delete()
             preferences.deleteProjectChats(project.id)
         }
     }
@@ -2809,7 +3074,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 Triple(
                     readWorkspace(project),
                     if (project.rootPath.isBlank()) detectNestedProjectRoot(project) else null,
-                    findAndroidGradleProjectRoot(projectWorkspaceRoot(project)) != null,
+                    findAndroidProjectRoot(projectWorkspaceRoot(project)) != null,
                 )
             }
             if (_state.value.activeProject?.id == project.id) {
@@ -2906,7 +3171,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val current = _state.value
         val project = current.activeProject ?: return
         val chatId = current.activeChatId ?: return
-        if (current.isRunning || uris.isEmpty()) return
+        if (uris.isEmpty()) return
         val remaining = (MAX_ATTACHMENTS_PER_MESSAGE - current.pendingAttachments.size).coerceAtLeast(0)
         if (remaining == 0) {
             _state.update { it.copy(toastMessage = "You can attach up to $MAX_ATTACHMENTS_PER_MESSAGE files per message") }
@@ -3039,7 +3304,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val attachments = state.value.pendingAttachments
-        if ((prompt.isBlank() && attachments.isEmpty()) || state.value.isRunning) return
+        if (prompt.isBlank() && attachments.isEmpty()) return
+        if (state.value.isRunning || state.value.androidBuildRunning) {
+            queueFollowUp(project, prompt, attachments)
+            return
+        }
+        if (state.value.projectTerminalRunning) {
+            _state.update { it.copy(toastMessage = "Wait for the terminal command to finish, then send your message.") }
+            return
+        }
+        startPrompt(project, prompt, attachments)
+    }
+
+    private fun queueFollowUp(project: Project, prompt: String, attachments: List<ChatAttachment>) {
+        val requestText = prompt.trim().ifBlank { "Please review the attached files." }
+        pendingFollowUps.addLast(QueuedFollowUp(projectId = project.id, prompt = requestText, attachments = attachments))
+        _state.update {
+            it.copy(
+                pendingAttachments = emptyList(),
+                queuedFollowUps = pendingFollowUps.toList(),
+                toastMessage = "Follow-up queued",
+            )
+        }
+    }
+
+    fun steerQueuedFollowUp(id: String) {
+        if (steeringToFollowUp) return
+        val selected = pendingFollowUps.firstOrNull { it.id == id } ?: return
+        pendingFollowUps.remove(selected)
+        pendingFollowUps.addFirst(selected)
+        _state.update {
+            it.copy(
+                queuedFollowUps = pendingFollowUps.toList(),
+                toastMessage = "Steering to this follow-up",
+            )
+        }
+        when {
+            _state.value.isRunning -> {
+                steeringToFollowUp = true
+                viewModelScope.launch { activeRuntime().stopActiveSession() }
+            }
+            _state.value.androidBuildRunning -> {
+                steeringToFollowUp = true
+                cancelAndroidBuild()
+            }
+            else -> startNextFollowUp()
+        }
+    }
+
+    fun removeQueuedFollowUp(id: String) {
+        val selected = pendingFollowUps.firstOrNull { it.id == id } ?: return
+        pendingFollowUps.remove(selected)
+        _state.update { it.copy(queuedFollowUps = pendingFollowUps.toList()) }
+    }
+
+    private fun startPrompt(project: Project, prompt: String, attachments: List<ChatAttachment>) {
         val requestText = prompt.trim().ifBlank { "Please review the attached files." }
         updateActiveChatTitle(requestText)
         _state.update {
@@ -3100,7 +3419,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopTask() {
         if (!_state.value.isRunning) return
+        steeringToFollowUp = false
+        pendingFollowUps.clear()
+        _state.update { it.copy(queuedFollowUps = emptyList()) }
         viewModelScope.launch { activeRuntime().stopActiveSession() }
+    }
+
+    private fun startNextFollowUp() {
+        val next = if (pendingFollowUps.isEmpty()) null else pendingFollowUps.removeFirst()
+        if (next == null) {
+            _state.update { it.copy(queuedFollowUps = emptyList()) }
+            return
+        }
+        val project = _state.value.activeProject
+        if (project == null || project.id != next.projectId) {
+            pendingFollowUps.clear()
+            _state.update { it.copy(queuedFollowUps = emptyList()) }
+            return
+        }
+        _state.update { it.copy(queuedFollowUps = pendingFollowUps.toList()) }
+        startPrompt(project, next.prompt, next.attachments)
     }
 
     fun undoLastChanges() {
@@ -3250,6 +3588,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun onRuntimeEvent(event: RuntimeEvent) {
+        val terminalEventForActiveSession =
+            (event is RuntimeEvent.SessionCompleted || event is RuntimeEvent.SessionFailed) &&
+                _state.value.isRunning &&
+                (_state.value.activeSessionId == null || _state.value.activeSessionId == event.sessionId)
         if (event is RuntimeEvent.SessionFailed && _state.value.agentKind == AgentKind.ANTIGRAVITY &&
             (event.reason.contains("sign-in", true) || event.reason.contains("authentication", true))) {
             antigravityAuthController.invalidateSession(event.reason)
@@ -3443,9 +3785,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        if (event is RuntimeEvent.SessionCompleted || event is RuntimeEvent.SessionFailed) {
+        if (terminalEventForActiveSession) {
             activeRuntimeRequest = null
             failedApiKeyIds.clear()
+            steeringToFollowUp = false
+            if (pendingFollowUps.isNotEmpty()) {
+                viewModelScope.launch {
+                    delay(150)
+                    if (!_state.value.isRunning) startNextFollowUp()
+                }
+            }
         }
         if (event is RuntimeEvent.FilesChanged || event is RuntimeEvent.SessionCompleted) {
             _state.value.activeProject?.id?.let { touchProject(it) }
@@ -3558,6 +3907,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val MAX_VISIBLE_WORKSPACE_ENTRIES = 2_000
         private const val MAX_PROJECT_TERMINAL_HISTORY = 100
         private const val MAX_PROJECT_TERMINAL_OUTPUT = 200_000
+        private const val MAX_ANDROID_BUILD_LOG = 300_000
         private const val MAX_ATTACHMENTS_PER_MESSAGE = 5
         private const val MAX_PROCESS_OUTPUT_BYTES = 512 * 1024
         private const val MAX_ATTACHMENT_BYTES = 25L * 1024L * 1024L
